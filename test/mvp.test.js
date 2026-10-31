@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
+import {spawn,spawnSync} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -123,6 +123,30 @@ test('RAFID pilot: real HTTP, persistent database and complete role workflows',a
   await request('/api/store',{cookie:supplier.cookie,body:{zone:'دمشق',fee:15000,minimum:50000,delivery:'09:00–13:00',weekdays:'0,1,2,3,4,5,6',cutoff_hour:18,daily_capacity:1}});
   const q=await quote(merchant,[{listing_id:1,quantity:1}]);const o=await order(merchant,q);const q2=await quote(merchant,[{listing_id:1,quantity:1}]);assert.notEqual(q.groups[0].delivery_date,q2.groups[0].delivery_date);
   const sub=(await request('/api/orders',{cookie:merchant.cookie})).data.find(x=>x.id===o.id).suborders[0];await action(merchant,sub.id,'cancel','اختبار الموعد');
+ });
+ await t.test('public offer redemption limits stay atomic and cancellation restores availability',async()=>{
+  const b={listing_id:3,price:50000,merchant_id:null,starts:new Date(Date.now()-60000).toISOString(),ends:new Date(Date.now()+3600000).toISOString(),max_uses:1};
+  await request('/api/offers',{cookie:supplier.cookie,body:{...b,merchant_id:1},status:422});
+  await request('/api/offers',{cookie:supplier.cookie,body:b});
+  const q1=await quote(merchant,[{listing_id:3,quantity:1}]),q2=await quote(outsider,[{listing_id:3,quantity:1}]);
+  const rows=await Promise.all([fetch(base+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json',Cookie:merchant.cookie,'Idempotency-Key':'offer-limit-a'},body:JSON.stringify({quote_id:q1.id})}),fetch(base+'/api/orders',{method:'POST',headers:{'Content-Type':'application/json',Cookie:outsider.cookie,'Idempotency-Key':'offer-limit-b'},body:JSON.stringify({quote_id:q2.id})})]);
+  assert.equal(rows.filter(r=>r.status===200).length,1);assert.equal(rows.filter(r=>r.status>=400).length,1);
+  const index=rows[0].status===200?0:1,winner=index===0?merchant:outsider,created=await rows[index].json();
+  const sub=(await request('/api/orders',{cookie:winner.cookie})).data.find(o=>o.id===created.id).suborders[0];await action(winner,sub.id,'cancel','اختبار إعادة صلاحية العرض');
+  assert.equal((await request('/api/catalog',{cookie:outsider.cookie})).data.find(l=>l.id===3).price,50000);
+ });
+ await t.test('live backup restores a consistent database and production refuses demo data',async()=>{
+  const destination=join(directory,'backup.sqlite');
+  const result=spawnSync(process.execPath,['scripts/backup.js',dbPath,destination],{encoding:'utf8'});assert.equal(result.status,0,result.stderr);
+  const original=new DatabaseSync(dbPath,{readOnly:true}),restored=new DatabaseSync(destination,{readOnly:true});
+  try{assert.equal(restored.prepare('PRAGMA integrity_check').get().integrity_check,'ok');assert.equal(restored.prepare('SELECT count(*) n FROM orders').get().n,original.prepare('SELECT count(*) n FROM orders').get().n);assert.equal(restored.prepare('SELECT sum(total) n FROM orders').get().n,original.prepare('SELECT sum(total) n FROM orders').get().n);}finally{original.close();restored.close();}
+  const bad=spawnSync(process.execPath,['server.js'],{env:{...process.env,DB_PATH:destination,DEMO_MODE:'0',PORT:String(port+1)},encoding:'utf8',timeout:5000});assert.notEqual(bad.status,0);assert.match(bad.stderr,/Demo database detected/);
+ });
+ await t.test('fresh pilot boot has only an administrator and no demo credentials',async()=>{
+  const productionPath=join(directory,'pilot.sqlite');
+  const bad=spawnSync(process.execPath,['server.js'],{env:{...process.env,DB_PATH:productionPath,DEMO_MODE:'0',ADMIN_PASSWORD:'short'},encoding:'utf8',timeout:5000});assert.notEqual(bad.status,0);assert.match(bad.stderr,/ADMIN_PASSWORD/);
+  const prod=spawn(process.execPath,['server.js'],{env:{...process.env,DB_PATH:productionPath,DEMO_MODE:'0',ADMIN_PASSWORD:'UniquePilotPassword2026!',PORT:String(port+1),HOST:'127.0.0.1'}});
+  try{await new Promise((resolve,reject)=>{let s='';const timer=setTimeout(()=>reject(new Error(s)),6000);prod.stdout.on('data',b=>{s+=b;if(s.includes('RAFID listening')){clearTimeout(timer);resolve();}});prod.once('error',reject);});const r=await fetch(`http://127.0.0.1:${port+1}/api/config`);assert.equal((await r.json()).demo,false);const clean=new DatabaseSync(productionPath,{readOnly:true});try{assert.equal(clean.prepare('SELECT count(*) n FROM users').get().n,1);assert.equal(clean.prepare('SELECT count(*) n FROM suppliers').get().n,0);}finally{clean.close();}}finally{const done=new Promise(r=>prod.once('exit',r));prod.kill();await done;}
  });
  await t.test('data and sessions survive process restart; logout revokes access',async()=>{
   await stop();output='';await start();const os=(await request('/api/orders',{cookie:merchant.cookie})).data;assert.ok(os.some(o=>o.id===orderId));
