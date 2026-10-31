@@ -1,0 +1,13 @@
+{
+  "name": "rafid-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "start": "node server.js",
+    "demo": "node --env-file=.env.demo server.js",
+    "test": "node --test --test-concurrency=1",
+    "check": "node --check server.js && node --check public/app.js"
+  }
+}
