@@ -60,6 +60,7 @@ node --env-file=.env server.js
 
 - [تصور المشروع ونطاق MVP](RAFID_Project_Concept_MVP_Roadmap.md)
 - [نطاق مهلة اليومين ومعايير التسليم](docs/MVP_48H.md)
+- [العروض الموسعة وقواعد الأهلية والكمية](docs/OFFERS.md)
 - [خطة التنفيذ والتحليل ومعايير القبول](docs/IMPLEMENTATION_PLAN.md)
 - [مهام أول مرحلة تنفيذ](docs/INITIAL_BACKLOG.md)
 
