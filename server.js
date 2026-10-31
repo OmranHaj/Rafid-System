@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {createOfferEngine} from './offers.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -72,6 +73,8 @@ if (!one('SELECT id FROM users LIMIT 1')) {
 // Demo databases must never silently become production databases.
 if (!demo && one("SELECT id FROM users WHERE email='merchant@rafid.local'")) throw new Error('Demo database detected. Use a fresh DB_PATH for production.');
 
+const offerEngine=createOfferEngine({db,need,int,str,transaction,audit});
+
 function accessible(u, id) {
   const sub = one('SELECT s.*,o.merchant_id,o.address,o.zone,o.created,o.id parent_id,u.name merchant_name,sp.name supplier_name FROM suborders s JOIN orders o ON o.id=s.order_id JOIN users u ON u.id=o.merchant_id JOIN suppliers sp ON sp.id=s.supplier_id WHERE s.id=?',id);
   need(sub, 'الطلب غير موجود',404);
@@ -88,11 +91,11 @@ function fullSub(u, sub) {
   if (sub.trip_id) copy.driver_name=one('SELECT u.name FROM trips t JOIN users u ON u.id=t.driver_id WHERE t.id=?',sub.trip_id)?.name;
   return copy;
 }
-function catalog(u) {
+function catalog(u,context={}) {
   return all('SELECT l.*,p.name,p.brand,p.pack,p.category,p.weight,s.name supplier_name,s.zone,s.fee,s.minimum,s.delivery FROM listings l JOIN products p ON p.id=l.product_id JOIN suppliers s ON s.id=l.supplier_id WHERE s.active=1 ORDER BY p.id,s.id').map(l=>{
-    const o=one('SELECT * FROM offers WHERE listing_id=? AND (merchant_id IS NULL OR merchant_id=?) AND starts<=? AND ends>? AND uses<max_uses ORDER BY price,id LIMIT 1',l.id,u.role==='merchant'?u.id:-1,now(),now());
+    const policy=offerEngine.forListing(l,u,{zone:context.zone,quantity:context.quantities?.get(l.id)||1});
     const rating=one('SELECT round(avg(r.score),1) score FROM ratings r JOIN suborders s ON s.id=r.suborder_id WHERE s.supplier_id=?',l.supplier_id);
-    return {...l,base_price:l.price,price:o?Math.min(l.price,o.price):l.price,offer_id:o&&o.price<l.price?o.id:null,private_offer:!!o?.merchant_id,rating:rating?.score||null};
+    return {...l,base_price:l.price,...policy,rating:rating?.score||null};
   });
 }
 function nextDelivery(s) {
@@ -109,7 +112,7 @@ function nextDelivery(s) {
 function priceCart(u,b) {
   const zone=str(b.zone,'المنطقة',60), address=str(b.address,'العنوان',500);
   need(Array.isArray(b.items)&&b.items.length>0&&b.items.length<=100,'السلة فارغة أو كبيرة جدًا');
-  const available=catalog(u), seen=new Set(), groups=new Map();
+  const available=catalog(u,{zone,quantities:new Map(b.items.map(i=>[i.listing_id,i.quantity]))}), seen=new Set(), groups=new Map();
   for(const i of b.items) {
     int(i.listing_id,'المنتج',1); int(i.quantity,'الكمية',1,10000); need(!seen.has(i.listing_id),'منتج مكرر'); seen.add(i.listing_id);
     const l=available.find(x=>x.id===i.listing_id); need(l,'عرض غير متاح'); need(l.zone===zone,'المورد لا يخدم هذه المنطقة'); need(i.quantity>=l.min_qty,'لم يتحقق الحد الأدنى للكمية'); need(i.quantity<=l.stock,'المخزون غير كافٍ');
@@ -122,7 +125,7 @@ function priceCart(u,b) {
   return {zone,address,groups:result,total,currency:'SYP',pricePolicy:'السعر ينتظر تأكيد المورد؛ لا تعديل دون موافقتك'};
 }
 function release(sub) {
-  for(const i of all('SELECT * FROM order_items WHERE suborder_id=?',sub.id)) { sql('UPDATE listings SET stock=stock+? WHERE id=?',i.quantity,i.listing_id); if(i.offer_id) sql('UPDATE offers SET uses=MAX(0,uses-1) WHERE id=?',i.offer_id); }
+  for(const i of all('SELECT * FROM order_items WHERE suborder_id=?',sub.id)) { sql('UPDATE listings SET stock=stock+? WHERE id=?',i.quantity,i.listing_id); if(i.offer_id) offerEngine.release(i.offer_id,i.quantity); }
 }
 function expireReservations() {
   const expired=all("SELECT * FROM suborders WHERE status='pending' AND expires<?",Date.now());
@@ -182,13 +185,11 @@ async function api(req,res,url,u,b) {
     // Private pricing can target only a merchant with an existing commercial relationship.
     return u.role==='admin'?all("SELECT id,name FROM users WHERE role='merchant'"):all('SELECT DISTINCT u.id,u.name FROM users u JOIN orders o ON o.merchant_id=u.id JOIN suborders s ON s.order_id=o.id WHERE s.supplier_id=?',u.supplier_id);
   }
-  if(p==='/api/offers'&&method==='GET') { role(u,'supplier'); return all('SELECT o.*,p.name FROM offers o JOIN listings l ON l.id=o.listing_id JOIN products p ON p.id=l.product_id WHERE l.supplier_id=?',u.supplier_id); }
-  if(p==='/api/offers'&&method==='POST') {
-    role(u,'supplier'); const l=one('SELECT * FROM listings WHERE id=? AND supplier_id=?',b.listing_id,u.supplier_id); need(l,'المنتج غير موجود',404); int(b.price,'السعر',1,l.price); int(b.max_uses,'حد الاستفادة',1,1000000);
-    const start=Date.parse(b.starts),end=Date.parse(b.ends); need(Number.isFinite(start)&&Number.isFinite(end)&&end>start&&end>Date.now(),'فترة العرض غير صالحة');
-    if(b.merchant_id) need(one('SELECT o.id FROM orders o JOIN suborders s ON s.order_id=o.id WHERE o.merchant_id=? AND s.supplier_id=?',int(b.merchant_id,'المحل',1),u.supplier_id),'المحل غير مرتبط بطلباتك');
-    const r=sql('INSERT INTO offers(listing_id,price,merchant_id,starts,ends,max_uses) VALUES(?,?,?,?,?,?)',l.id,b.price,b.merchant_id||null,new Date(start).toISOString(),new Date(end).toISOString(),b.max_uses); audit(u,'offer.create',r.lastInsertRowid); return {ok:true};
-  }
+  if(p==='/api/offer-groups'&&method==='GET'){role(u,'supplier');return offerEngine.groups(u);}
+  if(p==='/api/offer-groups'&&method==='POST'){role(u,'supplier');return offerEngine.saveGroup(u,b);}
+  if(p==='/api/offers'&&method==='GET'){role(u,'supplier');return offerEngine.listing(u.supplier_id);}
+  if(p==='/api/offers'&&method==='POST'){role(u,'supplier');return offerEngine.save(u,b);}
+  if(/^\/api\/offers\/\d+$/.test(p)&&method==='POST'){role(u,'supplier');return offerEngine.save(u,b,Number(p.split('/')[3]));}
   if(p==='/api/quotes'&&method==='POST') {
     role(u,'merchant'); const quote=priceCart(u,b), id=token(),expires=Date.now()+10*60000;
     sql('INSERT INTO quotes VALUES(?,?,?,?)',id,u.id,JSON.stringify(quote),expires); return {...quote,id,expires};
@@ -216,7 +217,7 @@ async function api(req,res,url,u,b) {
         const sr=sql("INSERT INTO suborders(order_id,supplier_id,status,total,fee,delivery,delivery_date,expires) VALUES(?,?,'pending',?,?,?,?,?)",id,g.supplier_id,g.total,g.fee,g.delivery,g.delivery_date,Date.now()+24*3600000),sid=Number(sr.lastInsertRowid);
         for(const i of g.items) {
           need(sql('UPDATE listings SET stock=stock-? WHERE id=? AND stock>=?',i.quantity,i.listing_id,i.quantity).changes===1,'نفد المخزون',409);
-          if(i.offer_id) need(sql('UPDATE offers SET uses=uses+1 WHERE id=? AND uses<max_uses',i.offer_id).changes===1,'انتهى العرض',409);
+          if(i.offer_id) offerEngine.reserve(i.offer_id,i.quantity);
           sql('INSERT INTO order_items(suborder_id,listing_id,product_id,name,pack,quantity,price,weight,offer_id) VALUES(?,?,?,?,?,?,?,?,?)',sid,i.listing_id,i.product_id,i.name,i.pack,i.quantity,i.price,i.weight,i.offer_id);
         }
         event(u,sid,'pending','بانتظار تأكيد المورد للسعر والمخزون');
