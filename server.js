@@ -83,7 +83,7 @@ function accessible(u, id) {
 }
 function fullSub(u, sub) {
   const copy = {...sub}; delete copy.proof; delete copy.proof_attempts; delete copy.proof_expires;
-  copy.items = all('SELECT id,product_id,name,pack,quantity,price,weight FROM order_items WHERE suborder_id=?',sub.id);
+  copy.items = all('SELECT id,product_id,name,pack,quantity,price,weight,offer_title,offer_terms FROM order_items WHERE suborder_id=?',sub.id);
   copy.events = all('SELECT e.action,e.note,e.created,u.name actor FROM events e JOIN users u ON u.id=e.actor_id WHERE suborder_id=? ORDER BY e.id',sub.id);
   copy.complaints = u.role==='driver'?[]:all('SELECT * FROM complaints WHERE suborder_id=?',sub.id);
   copy.rating = one('SELECT score FROM ratings WHERE suborder_id=?',sub.id)?.score || null;
@@ -118,7 +118,7 @@ function priceCart(u,b) {
     const l=available.find(x=>x.id===i.listing_id); need(l,'عرض غير متاح'); need(l.zone===zone,'المورد لا يخدم هذه المنطقة'); need(i.quantity>=l.min_qty,'لم يتحقق الحد الأدنى للكمية'); need(i.quantity<=l.stock,'المخزون غير كافٍ');
     if(!groups.has(l.supplier_id)) {const s=one('SELECT * FROM suppliers WHERE id=?',l.supplier_id),slot=nextDelivery(s);groups.set(l.supplier_id,{supplier_id:l.supplier_id,supplier_name:l.supplier_name,fee:l.fee,minimum:l.minimum,delivery:slot.label,delivery_date:slot.date,subtotal:0,items:[]});}
     const g=groups.get(l.supplier_id); g.subtotal+=l.price*i.quantity;
-    g.items.push({listing_id:l.id,product_id:l.product_id,name:l.name,pack:l.pack,quantity:i.quantity,price:l.price,weight:l.weight,offer_id:l.offer_id});
+    g.items.push({listing_id:l.id,product_id:l.product_id,name:l.name,pack:l.pack,quantity:i.quantity,price:l.price,weight:l.weight,offer_id:l.offer_id,offer_title:l.offer_title,offer_terms:l.offer_terms});
   }
   const result=[...groups.values()]; for(const g of result) { need(g.subtotal>=g.minimum,`الحد الأدنى لدى ${g.supplier_name}: ${g.minimum.toLocaleString()} ل.س`); g.total=g.subtotal+g.fee; }
   const total=result.reduce((s,g)=>s+g.total,0); need(Number.isSafeInteger(total)&&total<=1_000_000_000,'إجمالي السلة يتجاوز الحد المسموح');
@@ -218,7 +218,7 @@ async function api(req,res,url,u,b) {
         for(const i of g.items) {
           need(sql('UPDATE listings SET stock=stock-? WHERE id=? AND stock>=?',i.quantity,i.listing_id,i.quantity).changes===1,'نفد المخزون',409);
           if(i.offer_id) offerEngine.reserve(i.offer_id,i.quantity);
-          sql('INSERT INTO order_items(suborder_id,listing_id,product_id,name,pack,quantity,price,weight,offer_id) VALUES(?,?,?,?,?,?,?,?,?)',sid,i.listing_id,i.product_id,i.name,i.pack,i.quantity,i.price,i.weight,i.offer_id);
+          sql('INSERT INTO order_items(suborder_id,listing_id,product_id,name,pack,quantity,price,weight,offer_id,offer_title,offer_terms) VALUES(?,?,?,?,?,?,?,?,?,?,?)',sid,i.listing_id,i.product_id,i.name,i.pack,i.quantity,i.price,i.weight,i.offer_id,i.offer_title,i.offer_terms);
         }
         event(u,sid,'pending','بانتظار تأكيد المورد للسعر والمخزون');
       }

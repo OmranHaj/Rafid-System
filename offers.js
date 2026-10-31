@@ -8,6 +8,8 @@ export function createOfferEngine({db,need,int,str,transaction,audit}) {
     CREATE TABLE IF NOT EXISTS offer_group_members(group_id INTEGER NOT NULL REFERENCES offer_groups(id),merchant_id INTEGER NOT NULL REFERENCES users(id),PRIMARY KEY(group_id,merchant_id));`);
   if(!existing.includes('used_quantity'))run("UPDATE offers SET used_quantity=COALESCE((SELECT sum(i.quantity) FROM order_items i JOIN suborders s ON s.id=i.suborder_id WHERE i.offer_id=offers.id AND s.status NOT IN ('cancelled','rejected','expired')),0)");
   if(!existing.includes('audience'))run("UPDATE offers SET audience='merchant' WHERE merchant_id IS NOT NULL");
+  const itemColumns=all('PRAGMA table_info(order_items)').map(c=>c.name);
+  for(const column of ['offer_title','offer_terms'])if(!itemColumns.includes(column))db.exec(`ALTER TABLE order_items ADD COLUMN ${column} TEXT`);
   db.exec('PRAGMA user_version=3');
   const relationship=(supplierId,merchantId)=>one('SELECT o.id FROM orders o JOIN suborders s ON s.order_id=o.id JOIN users u ON u.id=o.merchant_id WHERE o.merchant_id=? AND s.supplier_id=? AND u.role=\'merchant\' AND u.active=1',merchantId,supplierId);
   function customerUses(offerId,merchantId){return one("SELECT count(*) n FROM order_items i JOIN suborders s ON s.id=i.suborder_id JOIN orders o ON o.id=s.order_id WHERE i.offer_id=? AND o.merchant_id=? AND s.status NOT IN ('cancelled','rejected','expired')",offerId,merchantId).n;}
@@ -45,7 +47,7 @@ export function createOfferEngine({db,need,int,str,transaction,audit}) {
       if(id)need(old,'العرض غير موجود',404);
       const l=one('SELECT * FROM listings WHERE id=? AND supplier_id=?',int(b.listing_id,'المنتج',1),u.supplier_id);need(l,'المنتج غير موجود',404);if(old)need(l.id===old.listing_id,'أنشئ عرضًا جديدًا لتغيير المنتج');
       const type=b.discount_type||'fixed',value=b.discount_value??b.price;need(['fixed','percent','amount'].includes(type),'نوع الخصم غير صالح');int(value,'قيمة الخصم',1,type==='percent'?99:type==='amount'?l.price-1:l.price);
-      const start=Date.parse(b.starts),end=Date.parse(b.ends);need(Number.isFinite(start)&&Number.isFinite(end)&&end>start&&end>Date.now(),'فترة العرض غير صالحة');
+      const start=Date.parse(b.starts),end=Date.parse(b.ends);need(Number.isFinite(start)&&Number.isFinite(end)&&end>start&&(end>Date.now()||(old&&b.active===false)),'فترة العرض غير صالحة');
       const audience=b.audience||(b.merchant_id?'merchant':'all');need(Object.keys(labels).includes(audience),'الجمهور غير صالح');
       const merchant=audience==='merchant'?int(b.merchant_id,'المحل',1):null,group=audience==='group'?int(b.group_id,'المجموعة',1):null;
       if(merchant)need(relationship(u.supplier_id,merchant),'المحل غير مرتبط بطلباتك');
