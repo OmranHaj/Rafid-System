@@ -32,6 +32,15 @@ PRAGMA user_version=1;`);
 const sql = (s, ...args) => db.prepare(s).run(...args);
 const one = (s, ...args) => db.prepare(s).get(...args);
 const all = (s, ...args) => db.prepare(s).all(...args);
+// Additive schema upgrades preserve databases created by earlier pilot commits.
+for (const [table,column,definition] of [
+  ['suppliers','weekdays',"TEXT NOT NULL DEFAULT '0,1,2,3,4,5,6'"],
+  ['suppliers','cutoff_hour','INTEGER NOT NULL DEFAULT 18'],
+  ['suppliers','daily_capacity','INTEGER NOT NULL DEFAULT 20'],
+  ['suborders','delivery_date',"TEXT NOT NULL DEFAULT ''"],
+  ['suborders','collection_confirmed','INTEGER NOT NULL DEFAULT 0']
+]) if(!all(`PRAGMA table_info(${table})`).some(c=>c.name===column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+db.exec('CREATE TABLE IF NOT EXISTS addresses(user_id INTEGER PRIMARY KEY REFERENCES users(id),zone TEXT NOT NULL,address TEXT NOT NULL); PRAGMA user_version=2;');
 const now = () => new Date().toISOString();
 const token = () => randomBytes(24).toString('hex');
 const hash = s => createHash('sha256').update(s).digest('hex');
@@ -86,6 +95,17 @@ function catalog(u) {
     return {...l,base_price:l.price,price:o?Math.min(l.price,o.price):l.price,offer_id:o&&o.price<l.price?o.id:null,private_offer:!!o?.merchant_id,rating:rating?.score||null};
   });
 }
+function nextDelivery(s) {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Damascus',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',hourCycle:'h23'}).formatToParts(new Date()).map(p=>[p.type,p.value]));
+  const today=new Date(`${parts.year}-${parts.month}-${parts.day}T00:00:00Z`),days=s.weekdays.split(',').map(Number),lead=Number(parts.hour)>=s.cutoff_hour?2:1;
+  for(let offset=lead;offset<=14;offset++) {
+    const day=new Date(today.getTime()+offset*86400000),key=day.toISOString().slice(0,10);
+    if(!days.includes(day.getUTCDay())) continue;
+    const count=one("SELECT count(*) n FROM suborders WHERE supplier_id=? AND delivery_date=? AND status NOT IN ('cancelled','rejected','expired')",s.id,key).n;
+    if(count<s.daily_capacity) return {date:key,label:`${key} · ${s.delivery.replace(/^غدًا\s*/, '')}`};
+  }
+  fail(422,`لا مواعيد متاحة خلال أسبوعين لدى ${s.name}`);
+}
 function priceCart(u,b) {
   const zone=str(b.zone,'المنطقة',60), address=str(b.address,'العنوان',500);
   need(Array.isArray(b.items)&&b.items.length>0&&b.items.length<=100,'السلة فارغة أو كبيرة جدًا');
@@ -93,7 +113,7 @@ function priceCart(u,b) {
   for(const i of b.items) {
     int(i.listing_id,'المنتج',1); int(i.quantity,'الكمية',1,10000); need(!seen.has(i.listing_id),'منتج مكرر'); seen.add(i.listing_id);
     const l=available.find(x=>x.id===i.listing_id); need(l,'عرض غير متاح'); need(l.zone===zone,'المورد لا يخدم هذه المنطقة'); need(i.quantity>=l.min_qty,'لم يتحقق الحد الأدنى للكمية'); need(i.quantity<=l.stock,'المخزون غير كافٍ');
-    if(!groups.has(l.supplier_id)) groups.set(l.supplier_id,{supplier_id:l.supplier_id,supplier_name:l.supplier_name,fee:l.fee,minimum:l.minimum,delivery:l.delivery,subtotal:0,items:[]});
+    if(!groups.has(l.supplier_id)) {const s=one('SELECT * FROM suppliers WHERE id=?',l.supplier_id),slot=nextDelivery(s);groups.set(l.supplier_id,{supplier_id:l.supplier_id,supplier_name:l.supplier_name,fee:l.fee,minimum:l.minimum,delivery:slot.label,delivery_date:slot.date,subtotal:0,items:[]});}
     const g=groups.get(l.supplier_id); g.subtotal+=l.price*i.quantity;
     g.items.push({listing_id:l.id,product_id:l.product_id,name:l.name,pack:l.pack,quantity:i.quantity,price:l.price,weight:l.weight,offer_id:l.offer_id});
   }
@@ -132,6 +152,7 @@ async function api(req,res,url,u,b) {
   }
   need(u,'سجل الدخول أولًا',401);
   if(p==='/api/me'&&method==='GET') return {id:u.id,name:u.name,role:u.role,supplier_id:u.supplier_id};
+  if(p==='/api/address'&&method==='GET') {role(u,'merchant');return one('SELECT zone,address FROM addresses WHERE user_id=?',u.id)||{zone:'دمشق',address:''};}
   if(p==='/api/logout'&&method==='POST') { sql('DELETE FROM sessions WHERE token=?',u.sessionHash); res.setHeader('Set-Cookie','rafid_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); return {ok:true}; }
   expireReservations();
   if(p==='/api/catalog'&&method==='GET') { role(u,'merchant','admin'); return catalog(u); }
@@ -150,7 +171,7 @@ async function api(req,res,url,u,b) {
   }
   if(/^\/api\/suppliers\/\d+\/activate$/.test(p)&&method==='POST') { role(u,'admin'); need(typeof b.active==='boolean','حالة غير صالحة'); const id=Number(p.split('/')[3]); need(one('SELECT id FROM suppliers WHERE id=?',id),'المورد غير موجود',404); sql('UPDATE suppliers SET active=? WHERE id=?',b.active?1:0,id); audit(u,'supplier.activation',id); return {ok:true}; }
   if(p==='/api/store'&&method==='GET') { role(u,'supplier'); return one('SELECT * FROM suppliers WHERE id=?',u.supplier_id); }
-  if(p==='/api/store'&&method==='POST') { role(u,'supplier'); int(b.fee,'التوصيل'); int(b.minimum,'الحد الأدنى'); sql('UPDATE suppliers SET zone=?,fee=?,minimum=?,delivery=? WHERE id=?',str(b.zone,'المنطقة',60),b.fee,b.minimum,str(b.delivery,'موعد التوصيل'),u.supplier_id); audit(u,'store.update',u.supplier_id); return {ok:true}; }
+  if(p==='/api/store'&&method==='POST') { role(u,'supplier'); int(b.fee,'التوصيل'); int(b.minimum,'الحد الأدنى'); const weekdays=str(b.weekdays,'أيام الخدمة',20); need(/^[0-6](,[0-6])*$/.test(weekdays),'الأيام أرقام من 0 للأحد إلى 6 للسبت مفصولة بفاصلة');int(b.cutoff_hour,'ساعة إغلاق طلبات الغد',0,23);int(b.daily_capacity,'السعة اليومية',1,10000);sql('UPDATE suppliers SET zone=?,fee=?,minimum=?,delivery=?,weekdays=?,cutoff_hour=?,daily_capacity=? WHERE id=?',str(b.zone,'المنطقة',60),b.fee,b.minimum,str(b.delivery,'فترة التوصيل'),weekdays,b.cutoff_hour,b.daily_capacity,u.supplier_id); audit(u,'store.update',u.supplier_id); return {ok:true}; }
   if(p==='/api/listings'&&method==='GET') { role(u,'supplier'); return all('SELECT l.*,p.name,p.brand,p.pack FROM listings l JOIN products p ON p.id=l.product_id WHERE supplier_id=?',u.supplier_id); }
   if(p==='/api/listings'&&method==='POST') {
     role(u,'supplier'); int(b.product_id,'المنتج',1); int(b.price,'السعر',1); int(b.stock,'المخزون',0,1000000); int(b.min_qty,'الحد الأدنى',1,10000); need(one('SELECT id FROM products WHERE id=?',b.product_id),'منتج غير موجود');
@@ -172,6 +193,15 @@ async function api(req,res,url,u,b) {
     role(u,'merchant'); const quote=priceCart(u,b), id=token(),expires=Date.now()+10*60000;
     sql('INSERT INTO quotes VALUES(?,?,?,?)',id,u.id,JSON.stringify(quote),expires); return {...quote,id,expires};
   }
+  if(p==='/api/recommendations'&&method==='POST') {
+    role(u,'merchant');const reference=priceCart(u,b),available=catalog(u).filter(l=>l.zone===reference.zone),quantities=new Map();
+    for(const g of reference.groups)for(const i of g.items)quantities.set(i.product_id,(quantities.get(i.product_id)||0)+i.quantity);
+    need(quantities.size<=10,'اقتراح الخطة متاح حتى عشرة منتجات مختلفة في السلة');
+    const options=[...quantities].map(([product_id,quantity])=>available.filter(l=>l.product_id===product_id&&l.stock>=quantity&&quantity>=l.min_qty).map(l=>({listing_id:l.id,quantity})));
+    let examined=0,best=reference,bestItems=b.items;const limit=512;
+    function visit(index,items){if(examined>=limit)return;if(index===options.length){examined++;try{const q=priceCart(u,{zone:reference.zone,address:reference.address,items});if(q.total<best.total){best=q;bestItems=items.map(i=>({...i}));}}catch(e){if(!e.status)throw e;}return;}for(const i of options[index]){visit(index+1,[...items,i]);if(examined>=limit)break;}}
+    visit(0,[]);const saving=reference.total-best.total;return {items:bestItems,total:best.total,reference_total:reference.total,saving,saving_percent:reference.total>0?Math.round(saving/reference.total*10000)/100:0,examined,capped:examined>=limit,description:'أفضل تكلفة ضمن الخطط المفحوصة لنفس المنتجات والعبوات والكميات، شاملة توصيل كل مورد. المرجع سلتك الحالية.',groups:best.groups};
+  }
   if(p==='/api/orders'&&method==='POST') {
     role(u,'merchant'); const key=str(req.headers['idempotency-key'],'مفتاح التأكيد',100),quoteId=str(b.quote_id,'عرض السعر',100),fingerprint=hash(quoteId);
     return transaction(()=>{
@@ -181,8 +211,9 @@ async function api(req,res,url,u,b) {
       const q=JSON.parse(row.payload), fresh=priceCart(u,{zone:q.zone,address:q.address,items:q.groups.flatMap(g=>g.items.map(i=>({listing_id:i.listing_id,quantity:i.quantity})))});
       need(JSON.stringify(q)===JSON.stringify(fresh),'تغير السعر أو التوصيل. راجع السلة مجددًا',409);
       const r=sql('INSERT INTO orders(merchant_id,address,zone,total,created,idempotency,fingerprint) VALUES(?,?,?,?,?,?,?)',u.id,q.address,q.zone,q.total,now(),key,fingerprint),id=Number(r.lastInsertRowid);
+      sql('INSERT INTO addresses(user_id,zone,address) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET zone=excluded.zone,address=excluded.address',u.id,q.zone,q.address);
       for(const g of q.groups) {
-        const sr=sql("INSERT INTO suborders(order_id,supplier_id,status,total,fee,delivery,expires) VALUES(?,?,'pending',?,?,?,?)",id,g.supplier_id,g.total,g.fee,g.delivery,Date.now()+24*3600000),sid=Number(sr.lastInsertRowid);
+        const sr=sql("INSERT INTO suborders(order_id,supplier_id,status,total,fee,delivery,delivery_date,expires) VALUES(?,?,'pending',?,?,?,?,?)",id,g.supplier_id,g.total,g.fee,g.delivery,g.delivery_date,Date.now()+24*3600000),sid=Number(sr.lastInsertRowid);
         for(const i of g.items) {
           need(sql('UPDATE listings SET stock=stock-? WHERE id=? AND stock>=?',i.quantity,i.listing_id,i.quantity).changes===1,'نفد المخزون',409);
           if(i.offer_id) need(sql('UPDATE offers SET uses=uses+1 WHERE id=? AND uses<max_uses',i.offer_id).changes===1,'انتهى العرض',409);
@@ -201,9 +232,10 @@ async function api(req,res,url,u,b) {
   if(/^\/api\/suborders\/\d+\/action$/.test(p)&&method==='POST') {
     return transaction(()=>{
       const sub=accessible(u,Number(p.split('/')[3])),action=str(b.action,'الإجراء',30), note=typeof b.note==='string'?b.note.trim().slice(0,500):'';
-      const transitions={confirm:['pending','confirmed','supplier'],prepare:['confirmed','preparing','supplier'],ready:['preparing','ready','supplier'],pickup:['assigned','picked_up','driver'],depart:['picked_up','in_transit','driver'],arrive:['in_transit','arrived','driver']};
+      const transitions={confirm:['pending','confirmed','supplier'],prepare:['confirmed','preparing','supplier'],ready:['preparing','ready','supplier'],accept:['assigned','accepted','driver'],pickup:['accepted','picked_up','driver'],depart:['picked_up','in_transit','driver'],arrive:['in_transit','arrived','driver']};
       if(transitions[action]) {
         const [from,to,actor]=transitions[action]; role(u,actor); need(sub.status===from,'حالة الطلب تغيرت؛ حدّث الصفحة',409);
+        if(action==='depart') need(!one("SELECT id FROM suborders WHERE trip_id=? AND status IN ('assigned','accepted')",sub.trip_id),'استلم بضائع الرحلة كاملة قبل بدء التوصيل');
         if(action==='confirm') need(one('SELECT active FROM suppliers WHERE id=?',sub.supplier_id).active,'المورد غير مفعل');
         if(action==='pickup') sql('UPDATE suborders SET proof=?,proof_attempts=0,proof_expires=? WHERE id=?',String(100000+randomBytes(4).readUInt32BE()%900000),Date.now()+24*3600000,sub.id);
         sql('UPDATE suborders SET status=? WHERE id=?',to,sub.id); event(u,sub.id,to,note);
@@ -211,7 +243,9 @@ async function api(req,res,url,u,b) {
         if(action==='reject') { role(u,'supplier'); need(sub.status==='pending','يمكن رفض طلب بانتظار الموافقة فقط'); }
         else { role(u,'merchant','admin'); need(sub.status==='pending','الإلغاء الذاتي متاح قبل قبول المورد فقط'); }
         need(note.length>0,'اذكر السبب'); release(sub); sql('UPDATE suborders SET status=? WHERE id=?',action==='reject'?'rejected':'cancelled',sub.id); event(u,sub.id,action==='reject'?'rejected':'cancelled',note);
-      } else if(action==='platform') { role(u,'supplier'); need(sub.status==='ready','يجب تجهيز الطلب أولًا'); sql("UPDATE suborders SET method='platform' WHERE id=?",sub.id); event(u,sub.id,'platform_requested'); }
+      } else if(action==='decline') {role(u,'driver');need(sub.status==='assigned','رفض المهمة قبل قبولها فقط');need(note.length>0,'اذكر سبب الرفض');sql("UPDATE suborders SET status='ready',trip_id=NULL WHERE id=?",sub.id);event(u,sub.id,'ready',`رفض السائق المهمة: ${note}`);}
+      else if(action==='receipt') {role(u,'merchant');need(sub.status==='delivered','تأكيد الاستلام بعد التسليم');need(!sub.collection_confirmed,'سبق تأكيد الاستلام');sql('UPDATE suborders SET collection_confirmed=1 WHERE id=?',sub.id);event(u,sub.id,'receipt',`أكد المحل استلام البضاعة ومبلغ التحصيل ${sub.collection} ل.س`);}
+      else if(action==='platform') { role(u,'supplier'); need(sub.status==='ready','يجب تجهيز الطلب أولًا'); sql("UPDATE suborders SET method='platform' WHERE id=?",sub.id); event(u,sub.id,'platform_requested'); }
       else if(action==='fail') { role(u,'driver'); need(['picked_up','in_transit','arrived'].includes(sub.status),'لا يمكن تسجيل تعذر الآن'); need(note.length>0,'اذكر سبب التعذر'); sql("UPDATE suborders SET status='failed' WHERE id=?",sub.id); event(u,sub.id,'failed',note); }
       else if(action==='retry') { role(u,'admin'); need(sub.status==='failed','الطلب غير متعثر'); need(note.length>0,'وثق عودة الحمولة للمورد قبل إعادة الإسناد'); sql("UPDATE suborders SET status='ready',trip_id=NULL,proof=NULL,proof_attempts=0,proof_expires=NULL WHERE id=?",sub.id); event(u,sub.id,'ready',note); }
       else fail(422,'إجراء غير معروف');

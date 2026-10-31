@@ -67,7 +67,7 @@ test('RAFID pilot: real HTTP, persistent database and complete role workflows',a
   await request('/api/dispatch',{cookie:supplier.cookie,body:{driver_id:5,suborder_ids:[first.id]},status:409});
  });
  await t.test('delivery code is merchant-only; transitions and collection stay controlled',async()=>{
-  await action(driver,first.id,'arrive','',409);await action(driver,first.id,'pickup');
+  await action(driver,first.id,'arrive','',409);await action(driver,first.id,'accept');await action(driver,first.id,'pickup');
   const mine=(await request('/api/orders',{cookie:merchant.cookie})).data[0].suborders.find(s=>s.id===first.id);assert.match(mine.deliveryCode,/^\d{6}$/);
   const theirs=(await request('/api/orders',{cookie:driver.cookie})).data[0];assert.equal(theirs.deliveryCode,undefined);assert.equal(theirs.proof,undefined);
   await action(driver,first.id,'depart');await action(driver,first.id,'arrive');
@@ -99,7 +99,7 @@ test('RAFID pilot: real HTTP, persistent database and complete role workflows',a
   const q=await quote(merchant,[{listing_id:5,quantity:1},{listing_id:6,quantity:1}]);const o=await order(merchant,q);const subs=(await request('/api/orders',{cookie:merchant.cookie})).data.find(x=>x.id===o.id).suborders;
   for(const s of subs){const owner=s.supplier_id===1?supplier:supplier2;await action(owner,s.id,'confirm');await action(owner,s.id,'prepare');await action(owner,s.id,'ready');await action(owner,s.id,'platform');}
   await request('/api/dispatch',{cookie:admin.cookie,body:{driver_id:6,suborder_ids:subs.map(s=>s.id)}});
-  for(const s of subs)await action(platform,s.id,'pickup');
+  for(const s of subs){await action(platform,s.id,'accept');await action(platform,s.id,'pickup');}
   await action(platform,subs[0].id,'fail','المحل مغلق');await action(platform,subs[1].id,'depart');await action(platform,subs[1].id,'arrive');
   const my=(await request('/api/orders',{cookie:merchant.cookie})).data.find(x=>x.id===o.id).suborders;
   const delivered=my.find(s=>s.id===subs[1].id);await request(`/api/suborders/${delivered.id}/deliver`,{cookie:platform.cookie,body:{code:delivered.deliveryCode,collection:0}});
@@ -113,6 +113,16 @@ test('RAFID pilot: real HTTP, persistent database and complete role workflows',a
   await action(supplier,sub.id,'confirm');await action(supplier,sub.id,'prepare');await action(supplier,sub.id,'ready');await request('/api/dispatch',{cookie:supplier.cookie,body:{driver_id:small.user_id,suborder_ids:[sub.id]},status:422});
   const pending=await order(merchant,await quote(merchant,[{listing_id:1,quantity:1}]));const raw=new DatabaseSync(dbPath);raw.prepare('UPDATE suborders SET expires=0 WHERE order_id=?').run(pending.id);raw.close();
   const expired=(await request('/api/orders',{cookie:merchant.cookie})).data.find(o=>o.id===pending.id);assert.equal(expired.suborders[0].status,'expired');
+ });
+ await t.test('recommendations include delivery fees, schedules and receipt acknowledgement',async()=>{
+  const input={zone:'دمشق',address:'اختبار الخطة',items:[{listing_id:2,quantity:2},{listing_id:3,quantity:1}]};
+  const plan=(await request('/api/recommendations',{cookie:merchant.cookie,body:input})).data;
+  assert.ok(plan.total<=plan.reference_total);assert.equal(plan.reference_total-plan.total,plan.saving);assert.ok(plan.examined>0);assert.equal(plan.items.reduce((s,i)=>s+i.quantity,0),3);
+  await action(merchant,first.id,'receipt');await action(merchant,first.id,'receipt','',422);
+  const address=(await request('/api/address',{cookie:merchant.cookie})).data;assert.ok(address.address.includes('اختبار'));
+  await request('/api/store',{cookie:supplier.cookie,body:{zone:'دمشق',fee:15000,minimum:50000,delivery:'09:00–13:00',weekdays:'0,1,2,3,4,5,6',cutoff_hour:18,daily_capacity:1}});
+  const q=await quote(merchant,[{listing_id:1,quantity:1}]);const o=await order(merchant,q);const q2=await quote(merchant,[{listing_id:1,quantity:1}]);assert.notEqual(q.groups[0].delivery_date,q2.groups[0].delivery_date);
+  const sub=(await request('/api/orders',{cookie:merchant.cookie})).data.find(x=>x.id===o.id).suborders[0];await action(merchant,sub.id,'cancel','اختبار الموعد');
  });
  await t.test('data and sessions survive process restart; logout revokes access',async()=>{
   await stop();output='';await start();const os=(await request('/api/orders',{cookie:merchant.cookie})).data;assert.ok(os.some(o=>o.id===orderId));
