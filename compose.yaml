@@ -1,0 +1,15 @@
+services:
+  rafid:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set a unique ADMIN_PASSWORD in .env}
+      DEMO_MODE: '0'
+      SECURE_COOKIES: ${SECURE_COOKIES:-1}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to your HTTPS site}
+    volumes:
+      - rafid-data:/app/data
+volumes:
+  rafid-data:
