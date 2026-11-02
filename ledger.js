@@ -3,6 +3,28 @@ import { randomBytes } from 'node:crypto';
 
 let entrySeq = 0;
 
+// Platform share of every delivered invoice, in basis points (50 = 0.5%).
+export const COMMISSION_BPS = 50;
+
+const paymentsTable = name => `
+    CREATE TABLE ${name}(
+      id INTEGER PRIMARY KEY,
+      receipt_number TEXT NOT NULL UNIQUE,
+      payer_id INTEGER NOT NULL REFERENCES users(id),
+      supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      unallocated_amount INTEGER NOT NULL DEFAULT 0 CHECK(unallocated_amount >= 0),
+      currency TEXT NOT NULL DEFAULT 'SYP',
+      payment_method TEXT NOT NULL DEFAULT 'cash' CHECK(payment_method IN ('cash','bank_transfer','settlement_credit','manual_adjustment','sham_cash')),
+      collected_by_role TEXT NOT NULL CHECK(collected_by_role IN ('driver','supplier','admin','wallet')),
+      collected_by_id INTEGER NOT NULL REFERENCES users(id),
+      suborder_id INTEGER REFERENCES suborders(id),
+      memo TEXT NOT NULL DEFAULT '',
+      idempotency_key TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'recorded' CHECK(status IN ('recorded','allocated','partially_allocated','cancelled')),
+      created TEXT NOT NULL
+    );`;
+
 export function createLedgerEngine({ db, need, int, str, fail, transaction, audit, event, now, token }) {
   const one = (s, ...a) => db.prepare(s).get(...a);
   const all = (s, ...a) => db.prepare(s).all(...a);
@@ -72,23 +94,7 @@ export function createLedgerEngine({ db, need, int, str, fail, transaction, audi
       created TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS payments(
-      id INTEGER PRIMARY KEY,
-      receipt_number TEXT NOT NULL UNIQUE,
-      payer_id INTEGER NOT NULL REFERENCES users(id),
-      supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
-      amount INTEGER NOT NULL CHECK(amount > 0),
-      unallocated_amount INTEGER NOT NULL DEFAULT 0 CHECK(unallocated_amount >= 0),
-      currency TEXT NOT NULL DEFAULT 'SYP',
-      payment_method TEXT NOT NULL DEFAULT 'cash' CHECK(payment_method IN ('cash','bank_transfer','settlement_credit','manual_adjustment')),
-      collected_by_role TEXT NOT NULL CHECK(collected_by_role IN ('driver','supplier','admin')),
-      collected_by_id INTEGER NOT NULL REFERENCES users(id),
-      suborder_id INTEGER REFERENCES suborders(id),
-      memo TEXT NOT NULL DEFAULT '',
-      idempotency_key TEXT UNIQUE,
-      status TEXT NOT NULL DEFAULT 'recorded' CHECK(status IN ('recorded','allocated','partially_allocated','cancelled')),
-      created TEXT NOT NULL
-    );
+    ${paymentsTable('IF NOT EXISTS payments')}
 
     CREATE TABLE IF NOT EXISTS payment_allocations(
       id INTEGER PRIMARY KEY,
@@ -144,7 +150,37 @@ export function createLedgerEngine({ db, need, int, str, fail, transaction, audi
       resolved_at TEXT,
       created TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS platform_commissions(
+      id INTEGER PRIMARY KEY,
+      invoice_id INTEGER NOT NULL UNIQUE REFERENCES invoices(id),
+      suborder_id INTEGER NOT NULL REFERENCES suborders(id),
+      supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+      invoice_amount INTEGER NOT NULL CHECK(invoice_amount > 0),
+      rate_bps INTEGER NOT NULL CHECK(rate_bps >= 0),
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      status TEXT NOT NULL CHECK(status IN ('due','settled')),
+      settled_via TEXT CHECK(settled_via IN ('deducted','wallet')),
+      settlement_ref TEXT,
+      settled_at TEXT,
+      created TEXT NOT NULL
+    );
   `);
+
+  // SQLite cannot alter a CHECK, so databases created before Sham Cash get payments rebuilt.
+  if (!one("SELECT sql FROM sqlite_master WHERE type='table' AND name='payments'").sql.includes('sham_cash')) {
+    db.exec('PRAGMA foreign_keys=OFF');
+    try {
+      transaction(() => {
+        db.exec(paymentsTable('payments_new'));
+        db.exec('INSERT INTO payments_new SELECT id,receipt_number,payer_id,supplier_id,amount,unallocated_amount,currency,payment_method,collected_by_role,collected_by_id,suborder_id,memo,idempotency_key,status,created FROM payments');
+        db.exec('DROP TABLE payments');
+        db.exec('ALTER TABLE payments_new RENAME TO payments');
+      });
+    } finally {
+      db.exec('PRAGMA foreign_keys=ON');
+    }
+  }
 
   // 2. Seed standard Chart of Accounts
   const defaultAccounts = [
@@ -289,6 +325,14 @@ export function createLedgerEngine({ db, need, int, str, fail, transaction, audi
         lines
       });
 
+      const commission = accrueCommission(sub, invoiceId, invoiceNumber);
+
+      // Sham Cash was authorized at checkout, so it captures here without driver custody
+      if (sub.payment_method === 'sham_cash') {
+        captureShamCash(sub, order, invoiceId, commission);
+        return one('SELECT * FROM invoices WHERE id=?', invoiceId);
+      }
+
       // Handle Cash on Delivery / Collection
       const driverType = sub.method === 'platform' ? 'platform' : 'supplier';
       const actualCollected = Math.max(0, Math.min(collectedAmount, sub.total));
@@ -367,6 +411,143 @@ export function createLedgerEngine({ db, need, int, str, fail, transaction, audi
 
       return one('SELECT * FROM invoices WHERE id=?', invoiceId);
     });
+  }
+
+  // Commission moves from the supplier's goods revenue to platform revenue once the invoice is issued.
+  function accrueCommission(sub, invoiceId, invoiceNumber) {
+    const amount = Math.round(sub.total * COMMISSION_BPS / 10000);
+    if (amount <= 0) return null;
+    const res = run(
+      `INSERT INTO platform_commissions(invoice_id, suborder_id, supplier_id, invoice_amount, rate_bps, amount, status, created)
+       VALUES(?,?,?,?,?,?,'due',?)`,
+      invoiceId,
+      sub.id,
+      sub.supplier_id,
+      sub.total,
+      COMMISSION_BPS,
+      amount,
+      now()
+    );
+    postEntry({
+      referenceType: 'commission',
+      referenceId: Number(res.lastInsertRowid),
+      memo: `عمولة رافد على الفاتورة #${invoiceNumber}`,
+      lines: [
+        { accountCode: 'REVENUE_GOODS', partyRole: 'supplier', partyId: sub.supplier_id, debit: amount, credit: 0 },
+        { accountCode: 'COMMISSION_PLATFORM', partyRole: 'platform', debit: 0, credit: amount }
+      ]
+    });
+    return one('SELECT * FROM platform_commissions WHERE id=?', Number(res.lastInsertRowid));
+  }
+
+  // Settling hands the platform its share out of the supplier's cash.
+  function markCommissionsSettled(rows, via, reference) {
+    const amount = rows.reduce((acc, c) => acc + c.amount, 0);
+    postEntry({
+      referenceType: 'commission_settlement',
+      referenceId: reference,
+      memo: `تسوية عمولة رافد - مرجع #${reference}`,
+      lines: [
+        { accountCode: 'CASH_PLATFORM', partyRole: 'platform', debit: amount, credit: 0 },
+        { accountCode: 'CASH_SUPPLIER', partyRole: 'supplier', partyId: rows[0].supplier_id, debit: 0, credit: amount }
+      ]
+    });
+    for (const c of rows) {
+      run("UPDATE platform_commissions SET status='settled', settled_via=?, settlement_ref=?, settled_at=? WHERE id=?", via, reference, now(), c.id);
+    }
+  }
+
+  // Simulated gateway: no money moves, the receipt is recorded as if the wallet was debited.
+  function captureShamCash(sub, order, invoiceId, commission) {
+    const receiptNumber = `SC-DEMO-${sub.id}-${randomBytes(3).toString('hex').toUpperCase()}`;
+    const payRes = run(
+      `INSERT INTO payments(receipt_number, payer_id, supplier_id, amount, unallocated_amount, currency, payment_method, collected_by_role, collected_by_id, suborder_id, memo, idempotency_key, status, created)
+       VALUES(?,?,?,?,0,'SYP','sham_cash','wallet',?,?,?,?,'allocated',?)`,
+      receiptNumber,
+      order.merchant_id,
+      sub.supplier_id,
+      sub.total,
+      order.merchant_id,
+      sub.id,
+      `دفع شام كاش تجريبي من المحفظة ${sub.wallet_ref} عند تسليم الطلب #${sub.id}`,
+      `receipt-delivery-${sub.id}`,
+      now()
+    );
+    const paymentId = Number(payRes.lastInsertRowid);
+    run('INSERT INTO payment_allocations(payment_id, invoice_id, amount, created) VALUES(?,?,?,?)', paymentId, invoiceId, sub.total, now());
+    run("UPDATE invoices SET paid_amount=?, status='paid' WHERE id=?", sub.total, invoiceId);
+    postEntry({
+      referenceType: 'payment',
+      referenceId: paymentId,
+      memo: `دفع شام كاش تجريبي - إيصال #${receiptNumber}`,
+      lines: [
+        { accountCode: 'CASH_SUPPLIER', partyRole: 'supplier', partyId: sub.supplier_id, debit: sub.total, credit: 0 },
+        { accountCode: 'AR_MERCHANT', partyRole: 'merchant', partyId: order.merchant_id, debit: 0, credit: sub.total }
+      ]
+    });
+    if (commission) markCommissionsSettled([commission], 'deducted', receiptNumber);
+  }
+
+  function maskWallet(value) {
+    need(typeof value === 'string' && /^09\d{8}$/.test(value), 'رقم محفظة شام كاش يبدأ بـ 09 ومن عشرة أرقام');
+    return `${value.slice(0, 2)}••••${value.slice(-4)}`;
+  }
+
+  // Supplier settles cash-order commissions in one go from the simulated wallet
+  function settleCommissions(u, b) {
+    return transaction(() => {
+      const wallet = maskWallet(b.wallet);
+      const due = all("SELECT * FROM platform_commissions WHERE supplier_id=? AND status='due' ORDER BY id", u.supplier_id);
+      need(due.length, 'لا توجد عمولة مستحقة');
+      const total = due.reduce((acc, c) => acc + c.amount, 0);
+      need(b.amount === total, 'تغير المبلغ المستحق؛ حدّث الصفحة', 409);
+      const reference = `SC-DEMO-C${u.supplier_id}-${randomBytes(3).toString('hex').toUpperCase()}`;
+      markCommissionsSettled(due, 'wallet', reference);
+      audit(u, 'commission.settle', `${reference}:${wallet}`);
+      return { ok: true, reference, amount: total };
+    });
+  }
+
+  function getCommissionAccount(supplierId) {
+    const rows = all(
+      `SELECT c.*, i.invoice_number, i.issue_date, u.name as merchant_name
+       FROM platform_commissions c JOIN invoices i ON i.id=c.invoice_id JOIN users u ON u.id=i.merchant_id
+       WHERE c.supplier_id=? ORDER BY c.id DESC`,
+      supplierId
+    );
+    const sum = (list, key) => list.reduce((acc, c) => acc + c[key], 0);
+    const sales = sum(rows, 'invoice_amount');
+    const commission = sum(rows, 'amount');
+    const due = sum(rows.filter(c => c.status === 'due'), 'amount');
+    return {
+      rate_bps: COMMISSION_BPS,
+      invoices_count: rows.length,
+      total_sales: sales,
+      total_commission: commission,
+      settled_commission: commission - due,
+      due_commission: due,
+      net_sales: sales - commission,
+      rows
+    };
+  }
+
+  function getCommissionOverview() {
+    const suppliers = all(
+      `SELECT s.id, s.name, count(c.id) as invoices_count, coalesce(sum(c.invoice_amount),0) as total_sales,
+              coalesce(sum(c.amount),0) as total_commission,
+              coalesce(sum(CASE WHEN c.status='due' THEN c.amount ELSE 0 END),0) as due_commission
+       FROM suppliers s LEFT JOIN platform_commissions c ON c.supplier_id=s.id
+       GROUP BY s.id ORDER BY total_commission DESC, s.id`
+    );
+    const total = key => suppliers.reduce((acc, s) => acc + s[key], 0);
+    return {
+      rate_bps: COMMISSION_BPS,
+      total_sales: total('total_sales'),
+      total_commission: total('total_commission'),
+      due_commission: total('due_commission'),
+      settled_commission: total('total_commission') - total('due_commission'),
+      suppliers
+    };
   }
 
   // 5. Manual Payment / Partial Payment Allocation
@@ -806,6 +987,10 @@ export function createLedgerEngine({ db, need, int, str, fail, transaction, audi
     getMerchantStatement,
     getSupplierAgingReport,
     setCreditTerms,
-    getCreditTerms
+    getCreditTerms,
+    maskWallet,
+    settleCommissions,
+    getCommissionAccount,
+    getCommissionOverview
   };
 }

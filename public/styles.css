@@ -5,3 +5,4 @@
 
 [hidden]{display:none!important}.audience-list{grid-column:1/-1;max-height:240px;overflow:auto}.audience-list .checkline input{margin:0}.audience-list .checkline{justify-content:flex-start}
 .chart-container{background:#fafcf8;border:1px solid #e2e8dc;border-radius:12px;padding:12px;margin:12px 0}.chart-bar rect{transition:all .2s ease;cursor:pointer}.chart-bar:hover rect,.chart-bar:focus rect{fill:#1b4d3e;opacity:1;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.15))}.badge.partially_paid{background:#e3f2fd;color:#1976d2}.badge.verified{background:#e8f5e9;color:#2e7d32}.badge.disputed{background:#ffebee;color:#c62828}
+.btn.sham{background:#8a1538;color:#fff}.btn.sham:hover{background:#6f102c}.sham-notice{background:#fbeef2;border-color:#f0d0da;color:#7a1f3b}.sham-tag{color:#8a1538;font-weight:600}

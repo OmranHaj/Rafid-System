@@ -41,7 +41,9 @@ for (const [table,column,definition] of [
   ['suppliers','cutoff_hour','INTEGER NOT NULL DEFAULT 18'],
   ['suppliers','daily_capacity','INTEGER NOT NULL DEFAULT 20'],
   ['suborders','delivery_date',"TEXT NOT NULL DEFAULT ''"],
-  ['suborders','collection_confirmed','INTEGER NOT NULL DEFAULT 0']
+  ['suborders','collection_confirmed','INTEGER NOT NULL DEFAULT 0'],
+  ['suborders','payment_method',"TEXT NOT NULL DEFAULT 'cash'"],
+  ['suborders','wallet_ref','TEXT']
 ]) if(!all(`PRAGMA table_info(${table})`).some(c=>c.name===column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 db.exec('CREATE TABLE IF NOT EXISTS addresses(user_id INTEGER PRIMARY KEY REFERENCES users(id),zone TEXT NOT NULL,address TEXT NOT NULL); PRAGMA user_version=2;');
 const now = () => new Date().toISOString();
@@ -215,7 +217,11 @@ async function api(req,res,url,u,b) {
     visit(0,[]);const saving=reference.total-best.total;return {items:bestItems,total:best.total,reference_total:reference.total,saving,saving_percent:reference.total>0?Math.round(saving/reference.total*10000)/100:0,examined,capped:examined>=limit,description:'أفضل تكلفة ضمن الخطط المفحوصة لنفس المنتجات والعبوات والكميات، شاملة توصيل كل مورد. المرجع سلتك الحالية.',groups:best.groups};
   }
   if(p==='/api/orders'&&method==='POST') {
-    role(u,'merchant'); const key=str(req.headers['idempotency-key'],'مفتاح التأكيد',100),quoteId=str(b.quote_id,'عرض السعر',100),fingerprint=hash(quoteId);
+    role(u,'merchant'); const key=str(req.headers['idempotency-key'],'مفتاح التأكيد',100),quoteId=str(b.quote_id,'عرض السعر',100),fingerprint=hash(quoteId),payment=b.payment_method??'cash';
+    need(['cash','sham_cash'].includes(payment),'طريقة الدفع غير صالحة');
+    // The simulated gateway marks invoices paid without moving money, so it must never reach a pilot.
+    need(payment==='cash'||demo,'شام كاش التجريبي متاح في بيئة العرض فقط');
+    const wallet=payment==='sham_cash'?ledgerEngine.maskWallet(b.wallet):null;
     return transaction(()=>{
       const existing=one('SELECT * FROM orders WHERE merchant_id=? AND idempotency=?',u.id,key);
       if(existing) { need(existing.fingerprint===fingerprint,'مفتاح مكرر لعملية مختلفة',409); return {id:existing.id,reused:true}; }
@@ -225,13 +231,14 @@ async function api(req,res,url,u,b) {
       const r=sql('INSERT INTO orders(merchant_id,address,zone,total,created,idempotency,fingerprint) VALUES(?,?,?,?,?,?,?)',u.id,q.address,q.zone,q.total,now(),key,fingerprint),id=Number(r.lastInsertRowid);
       sql('INSERT INTO addresses(user_id,zone,address) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET zone=excluded.zone,address=excluded.address',u.id,q.zone,q.address);
       for(const g of q.groups) {
-        const sr=sql("INSERT INTO suborders(order_id,supplier_id,status,total,fee,delivery,delivery_date,expires) VALUES(?,?,'pending',?,?,?,?,?)",id,g.supplier_id,g.total,g.fee,g.delivery,g.delivery_date,Date.now()+24*3600000),sid=Number(sr.lastInsertRowid);
+        const sr=sql("INSERT INTO suborders(order_id,supplier_id,status,total,fee,delivery,delivery_date,expires,payment_method,wallet_ref) VALUES(?,?,'pending',?,?,?,?,?,?,?)",id,g.supplier_id,g.total,g.fee,g.delivery,g.delivery_date,Date.now()+24*3600000,payment,wallet),sid=Number(sr.lastInsertRowid);
         for(const i of g.items) {
           need(sql('UPDATE listings SET stock=stock-? WHERE id=? AND stock>=?',i.quantity,i.listing_id,i.quantity).changes===1,'نفد المخزون',409);
           if(i.offer_id) offerEngine.reserve(i.offer_id,i.quantity);
           sql('INSERT INTO order_items(suborder_id,listing_id,product_id,name,pack,quantity,price,weight,offer_id,offer_title,offer_terms) VALUES(?,?,?,?,?,?,?,?,?,?,?)',sid,i.listing_id,i.product_id,i.name,i.pack,i.quantity,i.price,i.weight,i.offer_id,i.offer_title,i.offer_terms);
         }
         event(u,sid,'pending','بانتظار تأكيد المورد للسعر والمخزون');
+        if(wallet) event(u,sid,'payment_authorized',`فوض المحل الدفع عبر شام كاش التجريبي من المحفظة ${wallet}؛ الخصم عند التسليم`);
       }
       audit(u,'order.create',id); return {id};
     });
@@ -256,7 +263,7 @@ async function api(req,res,url,u,b) {
         else { role(u,'merchant','admin'); need(sub.status==='pending','الإلغاء الذاتي متاح قبل قبول المورد فقط'); }
         need(note.length>0,'اذكر السبب'); release(sub); sql('UPDATE suborders SET status=? WHERE id=?',action==='reject'?'rejected':'cancelled',sub.id); event(u,sub.id,action==='reject'?'rejected':'cancelled',note);
       } else if(action==='decline') {role(u,'driver');need(sub.status==='assigned','رفض المهمة قبل قبولها فقط');need(note.length>0,'اذكر سبب الرفض');sql("UPDATE suborders SET status='ready',trip_id=NULL WHERE id=?",sub.id);event(u,sub.id,'ready',`رفض السائق المهمة: ${note}`);}
-      else if(action==='receipt') {role(u,'merchant');need(sub.status==='delivered','تأكيد الاستلام بعد التسليم');need(!sub.collection_confirmed,'سبق تأكيد الاستلام');sql('UPDATE suborders SET collection_confirmed=1 WHERE id=?',sub.id);event(u,sub.id,'receipt',`أكد المحل استلام البضاعة ومبلغ التحصيل ${sub.collection} ل.س`);}
+      else if(action==='receipt') {role(u,'merchant');need(sub.status==='delivered','تأكيد الاستلام بعد التسليم');need(!sub.collection_confirmed,'سبق تأكيد الاستلام');sql('UPDATE suborders SET collection_confirmed=1 WHERE id=?',sub.id);event(u,sub.id,'receipt',sub.payment_method==='sham_cash'?'أكد المحل استلام البضاعة؛ الدفع تم عبر شام كاش التجريبي':`أكد المحل استلام البضاعة ومبلغ التحصيل ${sub.collection} ل.س`);}
       else if(action==='platform') { role(u,'supplier'); need(sub.status==='ready','يجب تجهيز الطلب أولًا'); sql("UPDATE suborders SET method='platform' WHERE id=?",sub.id); event(u,sub.id,'platform_requested'); }
       else if(action==='fail') { role(u,'driver'); need(['picked_up','in_transit','arrived'].includes(sub.status),'لا يمكن تسجيل تعذر الآن'); need(note.length>0,'اذكر سبب التعذر'); sql("UPDATE suborders SET status='failed' WHERE id=?",sub.id); event(u,sub.id,'failed',note); }
       else if(action==='retry') { role(u,'admin'); need(sub.status==='failed','الطلب غير متعثر'); need(note.length>0,'وثق عودة الحمولة للمورد قبل إعادة الإسناد'); sql("UPDATE suborders SET status='ready',trip_id=NULL,proof=NULL,proof_attempts=0,proof_expires=NULL WHERE id=?",sub.id); event(u,sub.id,'ready',note); }
@@ -268,11 +275,11 @@ async function api(req,res,url,u,b) {
     role(u,'driver'); const sub=accessible(u,Number(p.split('/')[3])); need(sub.status==='arrived','أكد الوصول إلى المحل أولًا');
     need(sub.proof_attempts<5,'تم قفل الرمز بعد محاولات خاطئة؛ تواصل مع الإدارة',429);
     if(!sub.proof||sub.proof_expires<Date.now()||String(b.code)!==sub.proof) { sql('UPDATE suborders SET proof_attempts=proof_attempts+1 WHERE id=?',sub.id); fail(422,'رمز خاطئ أو منتهي'); }
-    int(b.collection,'المبلغ المحصل',0,sub.total);
+    const shamCash=sub.payment_method==='sham_cash',collection=shamCash?0:int(b.collection,'المبلغ المحصل',0,sub.total);
     return transaction(()=>{
-      sql("UPDATE suborders SET status='delivered',proof=NULL,collection=? WHERE id=?",b.collection,sub.id);
-      event(u,sub.id,'delivered',`تم التسليم بإثبات وتسجيل تحصيل ${b.collection} ل.س؛ يحتاج مطابقة المستلم`);
-      ledgerEngine.onSuborderDelivered(sub, u, b.collection);
+      sql("UPDATE suborders SET status='delivered',proof=NULL,collection=? WHERE id=?",collection,sub.id);
+      event(u,sub.id,'delivered',shamCash?`تم التسليم بإثبات وخصم ${sub.total} ل.س عبر شام كاش التجريبي`:`تم التسليم بإثبات وتسجيل تحصيل ${collection} ل.س؛ يحتاج مطابقة المستلم`);
+      ledgerEngine.onSuborderDelivered(sub, u, collection);
       analyticsEngine.refreshAggregates();
       audit(u,'delivery.complete',sub.id);
       return {ok:true};
@@ -360,6 +367,14 @@ async function api(req,res,url,u,b) {
   if(p==='/api/ledger/credit-terms'&&method==='POST') {
     role(u,'supplier','admin');
     return ledgerEngine.setCreditTerms(u,b);
+  }
+  if(p==='/api/commissions'&&method==='GET') {
+    role(u,'supplier','admin');
+    return u.role==='supplier'?ledgerEngine.getCommissionAccount(u.supplier_id):ledgerEngine.getCommissionOverview();
+  }
+  if(p==='/api/commissions/settle'&&method==='POST') {
+    role(u,'supplier'); need(demo,'شام كاش التجريبي متاح في بيئة العرض فقط');
+    return ledgerEngine.settleCommissions(u,b);
   }
   if(p==='/api/pro/subscription'&&method==='GET') {
     const type=u.role==='supplier'?'supplier':'merchant';

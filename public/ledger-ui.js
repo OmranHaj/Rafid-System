@@ -113,7 +113,7 @@ function renderMerchantLedger(stmt) {
             <td>${esc(p.supplier_name)}</td>
             <td>${date(p.created)}</td>
             <td><strong>${money(p.amount)} ل.س</strong></td>
-            <td><span class="badge">${p.payment_method === 'cash' ? 'نقداً' : p.payment_method === 'bank_transfer' ? 'حوالة بنكية' : esc(p.payment_method)}</span></td>
+            <td><span class="badge">${p.payment_method === 'cash' ? 'نقداً' : p.payment_method === 'bank_transfer' ? 'حوالة بنكية' : p.payment_method === 'sham_cash' ? 'شام كاش (تجريبي)' : esc(p.payment_method)}</span></td>
             <td>${esc(p.memo || '—')}</td>
           </tr>`).join('')}
         </tbody>
@@ -299,8 +299,98 @@ function renderAdminLedger(cols, rems) {
     </div>`;
 }
 
+const commissionRate = bps => (bps / 100).toLocaleString('ar-SY') + '٪';
+const shamNotice = '<div class="notice sham-notice"><strong>شام كاش · محاكاة للعرض</strong><br>لا تُنقل أي أموال حقيقية ولا ترتبط هذه الشاشة بخدمة شام كاش الفعلية.</div>';
+const walletField = () => field('رقم محفظة شام كاش', 'wallet', 'tel', '', 'inputmode="numeric" pattern="09[0-9]{8}" maxlength="10" dir="ltr" placeholder="09XXXXXXXX"');
+
+window.commissionsView = async function() {
+  const data = await api('/commissions');
+  return user.role === 'supplier' ? renderSupplierCommissions(data) : renderAdminCommissions(data);
+};
+
+function renderSupplierCommissions(a) {
+  return heading('حسابي مع رافد', `تحتسب رافد ${commissionRate(a.rate_bps)} من قيمة كل فاتورة بعد تسليم الطلب.`, a.due_commission > 0 && config.demo ? btn('تسديد المستحق عبر شام كاش', 'ledger-settle-commission', a.due_commission, 'sham') : '') +
+    `<div class="stats">
+      ${stat('إجمالي المبيعات', money(a.total_sales) + ' <small>ل.س</small>', `${money(a.invoices_count)} فاتورة`)}
+      ${stat('ما أخذته المنصة', money(a.settled_commission) + ' <small>ل.س</small>', `من أصل ${money(a.total_commission)} ل.س عمولة`)}
+      ${stat('المستحق لرافد', money(a.due_commission) + ' <small>ل.س</small>', 'من طلبات النقد')}
+      ${stat('صافي مبيعاتك', money(a.net_sales) + ' <small>ل.س</small>', 'بعد العمولة')}
+    </div>
+
+    <div class="section-label">
+      <h2>تفاصيل العمولة لكل فاتورة</h2>
+      <small>النسبة محفوظة مع الفاتورة وقت إصدارها</small>
+    </div>
+
+    <div class="panel table-wrap">
+      <table>
+        <thead>
+          <tr><th>الفاتورة</th><th>المحل</th><th>التاريخ</th><th>قيمة الفاتورة</th><th>النسبة</th><th>العمولة</th><th>الحالة</th></tr>
+        </thead>
+        <tbody>
+          ${a.rows.map(c => `<tr>
+            <td><strong>${esc(c.invoice_number)}</strong><br><small>طلب فرعي #${c.suborder_id}</small></td>
+            <td>${esc(c.merchant_name)}</td>
+            <td>${esc(c.issue_date)}</td>
+            <td>${money(c.invoice_amount)} ل.س</td>
+            <td>${commissionRate(c.rate_bps)}</td>
+            <td><strong>${money(c.amount)} ل.س</strong></td>
+            <td><span class="badge ${c.status === 'settled' ? 'verified' : 'pending'}">${c.status === 'due' ? 'مستحقة' : c.settled_via === 'deducted' ? 'خُصمت من دفعة شام كاش' : 'سُددت عبر شام كاش'}</span></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      ${!a.rows.length ? empty('لا توجد عمولات بعد', 'تظهر هنا عمولة كل فاتورة فور تسليم الطلب.') : ''}
+    </div>`;
+}
+
+function renderAdminCommissions(o) {
+  return heading('عمولات المنصة', `إيراد رافد بنسبة ${commissionRate(o.rate_bps)} من الفواتير المسلّمة لكل مورد.`) +
+    `<div class="stats">
+      ${stat('قيمة الفواتير المسلّمة', money(o.total_sales) + ' <small>ل.س</small>', 'كل الموردين')}
+      ${stat('إجمالي العمولات', money(o.total_commission) + ' <small>ل.س</small>', commissionRate(o.rate_bps))}
+      ${stat('المستلم فعلياً', money(o.settled_commission) + ' <small>ل.س</small>', 'خصم وتسديد')}
+      ${stat('المستحق على الموردين', money(o.due_commission) + ' <small>ل.س</small>', 'من طلبات النقد')}
+    </div>
+
+    <div class="panel table-wrap">
+      <h2>العمولات حسب المورد</h2>
+      <table>
+        <thead>
+          <tr><th>المورد</th><th>الفواتير</th><th>المبيعات</th><th>العمولة</th><th>المستحق</th></tr>
+        </thead>
+        <tbody>
+          ${o.suppliers.map(s => `<tr>
+            <td><strong>${esc(s.name)}</strong></td>
+            <td>${money(s.invoices_count)}</td>
+            <td>${money(s.total_sales)} ل.س</td>
+            <td><strong>${money(s.total_commission)} ل.س</strong></td>
+            <td>${money(s.due_commission)} ل.س</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
 // Modal actions for Ledger
 window.ledgerAction = async function(action, id) {
+  if (action === 'ledger-sham-checkout') {
+    if (!quote) throw new Error('راجع السلة أولًا');
+    modal('الدفع عبر شام كاش', shamNotice + form('sham-checkout',
+      `<p>إجمالي الطلب <strong>${money(quote.total)} ل.س</strong><br><small>يُفوّض المبلغ الآن ويُخصم عند التسليم فقط، ولا يُخصم شيء إن رُفض الطلب أو أُلغي.</small></p>` +
+      walletField(),
+      'تفويض الدفع وتأكيد الطلب'
+    ));
+  }
+
+  if (action === 'ledger-settle-commission') {
+    modal('تسديد عمولة رافد', shamNotice + form('sham-settle',
+      `<input type="hidden" name="amount" value="${id}">
+      <p>المبلغ المستحق <strong>${money(id)} ل.س</strong></p>` +
+      walletField(),
+      'تسديد المبلغ'
+    ));
+  }
+
   if (action === 'ledger-new-payment') {
     const merchants = await api('/merchants');
     modal('تسجيل دفعة يدوية', form('ledger-payment',
