@@ -10,6 +10,6 @@
     "start": "node server.js",
     "demo": "node --env-file=.env.demo server.js",
     "test": "node --test --test-concurrency=1",
-    "check": "node --check server.js && node --check offers.js && node --check public/app.js && node --check scripts/backup.js && node --check public/offers-ui.js"
+    "check": "node --check server.js && node --check offers.js && node --check ledger.js && node --check analytics.js && node --check public/app.js && node --check scripts/backup.js && node --check public/offers-ui.js && node --check public/ledger-ui.js && node --check public/pro-ui.js"
   }
 }

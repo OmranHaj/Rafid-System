@@ -1,5 +1,7 @@
 import http from 'node:http';
 import {createOfferEngine} from './offers.js';
+import {createLedgerEngine} from './ledger.js';
+import {createAnalyticsEngine} from './analytics.js';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
@@ -52,7 +54,8 @@ function need(test, message, status = 422) { if (!test) fail(status, message); }
 function str(value, label, max = 200) { need(typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max, `${label} مطلوب وبحد أقصى ${max} حرف`); return value.trim(); }
 function int(value, label, min = 0, max = 1_000_000_000) { need(Number.isSafeInteger(value) && value >= min && value <= max, `${label} غير صالح`); return value; }
 function role(u, ...roles) { need(roles.includes(u.role), 'ليست لديك صلاحية لهذه العملية', 403); }
-function transaction(fn) { db.exec('BEGIN IMMEDIATE'); try { const result = fn(); db.exec('COMMIT'); return result; } catch (e) { db.exec('ROLLBACK'); throw e; } }
+let inTx = false;
+function transaction(fn) { if (inTx) return fn(); inTx = true; db.exec('BEGIN IMMEDIATE'); try { const result = fn(); db.exec('COMMIT'); return result; } catch (e) { db.exec('ROLLBACK'); throw e; } finally { inTx = false; } }
 function audit(u, action, entity) { sql('INSERT INTO audit(actor_id,action,entity,created) VALUES(?,?,?,?)', u.id, action, String(entity), now()); }
 function event(u, id, action, note = '') { sql('INSERT INTO events(suborder_id,actor_id,action,note,created) VALUES(?,?,?,?,?)', id, u.id, action, note, now()); }
 
@@ -74,6 +77,14 @@ if (!one('SELECT id FROM users LIMIT 1')) {
 if (!demo && one("SELECT id FROM users WHERE email='merchant@rafid.local'")) throw new Error('Demo database detected. Use a fresh DB_PATH for production.');
 
 const offerEngine=createOfferEngine({db,need,int,str,transaction,audit});
+const ledgerEngine=createLedgerEngine({db,need,int,str,fail,transaction,audit,event,now,token});
+const analyticsEngine=createAnalyticsEngine({db,need,int,str,fail,transaction,audit,now});
+if(demo){
+  try{
+    analyticsEngine.activateSubscription({id:1,role:'admin'},{entity_type:'supplier',entity_id:1,plan_id:'pro',duration_days:30,trial:true,notes:'Demo trial'});
+    analyticsEngine.activateSubscription({id:1,role:'admin'},{entity_type:'merchant',entity_id:2,plan_id:'pro',duration_days:30,trial:true,notes:'Demo trial'});
+  }catch(e){}
+}
 
 function accessible(u, id) {
   const sub = one('SELECT s.*,o.merchant_id,o.address,o.zone,o.created,o.id parent_id,u.name merchant_name,sp.name supplier_name FROM suborders s JOIN orders o ON o.id=s.order_id JOIN users u ON u.id=o.merchant_id JOIN suppliers sp ON sp.id=s.supplier_id WHERE s.id=?',id);
@@ -258,7 +269,14 @@ async function api(req,res,url,u,b) {
     need(sub.proof_attempts<5,'تم قفل الرمز بعد محاولات خاطئة؛ تواصل مع الإدارة',429);
     if(!sub.proof||sub.proof_expires<Date.now()||String(b.code)!==sub.proof) { sql('UPDATE suborders SET proof_attempts=proof_attempts+1 WHERE id=?',sub.id); fail(422,'رمز خاطئ أو منتهي'); }
     int(b.collection,'المبلغ المحصل',0,sub.total);
-    return transaction(()=>{ sql("UPDATE suborders SET status='delivered',proof=NULL,collection=? WHERE id=?",b.collection,sub.id); event(u,sub.id,'delivered',`تم التسليم بإثبات وتسجيل تحصيل ${b.collection} ل.س؛ يحتاج مطابقة المستلم`); audit(u,'delivery.complete',sub.id); return {ok:true}; });
+    return transaction(()=>{
+      sql("UPDATE suborders SET status='delivered',proof=NULL,collection=? WHERE id=?",b.collection,sub.id);
+      event(u,sub.id,'delivered',`تم التسليم بإثبات وتسجيل تحصيل ${b.collection} ل.س؛ يحتاج مطابقة المستلم`);
+      ledgerEngine.onSuborderDelivered(sub, u, b.collection);
+      analyticsEngine.refreshAggregates();
+      audit(u,'delivery.complete',sub.id);
+      return {ok:true};
+    });
   }
   if(p==='/api/drivers'&&method==='GET') { role(u,'supplier','admin'); return all(`SELECT d.*,u.name,u.email FROM drivers d JOIN users u ON u.id=d.user_id WHERE u.active=1 ${u.role==='supplier'?'AND d.supplier_id=?':''}`, ...(u.role==='supplier'?[u.supplier_id]:[])); }
   if(p==='/api/drivers'&&method==='POST') {
@@ -288,10 +306,108 @@ async function api(req,res,url,u,b) {
     const subs=all(`SELECT s.*,o.merchant_id FROM suborders s JOIN orders o ON o.id=s.order_id${where}`,...args);
     const delivered=subs.filter(s=>s.status==='delivered'); return {orders:subs.length,completed:delivered.length,pending:subs.filter(s=>s.status==='pending').length,failed:subs.filter(s=>s.status==='failed').length,gmv:delivered.reduce((a,s)=>a+s.total-s.fee,0),collections:delivered.reduce((a,s)=>a+s.collection,0),merchants:new Set(subs.map(s=>s.merchant_id)).size,audit:u.role==='admin'?all('SELECT a.*,u.name actor FROM audit a JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 100'):[]};
   }
+  if(p==='/api/ledger/statement'&&method==='GET') {
+    role(u,'merchant','supplier','admin');
+    const merchantId=u.role==='merchant'?u.id:(url.searchParams.get('merchant_id')?Number(url.searchParams.get('merchant_id')):null);
+    const supplierId=u.role==='supplier'?u.supplier_id:(url.searchParams.get('supplier_id')?Number(url.searchParams.get('supplier_id')):null);
+    need(merchantId,'المحل مطلوب لكشف الحساب');
+    return ledgerEngine.getMerchantStatement(merchantId,supplierId);
+  }
+  if(p==='/api/ledger/aging'&&method==='GET') {
+    role(u,'supplier','admin');
+    const supplierId=u.role==='supplier'?u.supplier_id:Number(url.searchParams.get('supplier_id')||1);
+    return ledgerEngine.getSupplierAgingReport(supplierId);
+  }
+  if(p==='/api/ledger/invoices'&&method==='GET') {
+    role(u,'merchant','supplier','admin');
+    let where='',args=[];
+    if(u.role==='merchant'){where='WHERE i.merchant_id=?';args.push(u.id);}
+    else if(u.role==='supplier'){where='WHERE i.supplier_id=?';args.push(u.supplier_id);}
+    return all(`SELECT i.*,s.name as supplier_name,u.name as merchant_name FROM invoices i JOIN suppliers s ON s.id=i.supplier_id JOIN users u ON u.id=i.merchant_id ${where} ORDER BY i.id DESC`,...args);
+  }
+  if(p==='/api/ledger/payments'&&method==='POST') {
+    role(u,'supplier','admin');
+    return ledgerEngine.recordPayment(u,b);
+  }
+  if(p==='/api/ledger/collections'&&method==='GET') {
+    role(u,'supplier','admin','driver');
+    let where='',args=[];
+    if(u.role==='supplier'){where='WHERE c.supplier_id=?';args.push(u.supplier_id);}
+    else if(u.role==='driver'){where='WHERE c.driver_id=?';args.push(u.id);}
+    return all(`SELECT c.*,s.name as supplier_name,m.name as merchant_name,d.name as driver_name FROM collections c JOIN suppliers s ON s.id=c.supplier_id JOIN users m ON m.id=c.merchant_id JOIN users d ON d.id=c.driver_id ${where} ORDER BY c.id DESC`,...args);
+  }
+  if(p==='/api/ledger/remittances'&&method==='GET') {
+    role(u,'supplier','admin','driver');
+    let where='',args=[];
+    if(u.role==='supplier'){where='WHERE r.supplier_id=?';args.push(u.supplier_id);}
+    else if(u.role==='driver'){where='WHERE r.driver_id=?';args.push(u.id);}
+    return all(`SELECT r.*,d.name as driver_name FROM cash_remittances r JOIN users d ON d.id=r.driver_id ${where} ORDER BY r.id DESC`,...args);
+  }
+  if(p==='/api/ledger/remittances'&&method==='POST') {
+    role(u,'driver','admin');
+    return ledgerEngine.recordRemittance(u,b);
+  }
+  if(p==='/api/ledger/reconcile'&&method==='POST') {
+    role(u,'supplier','admin');
+    return ledgerEngine.reconcileRemittance(u,b);
+  }
+  if(p==='/api/ledger/credit-terms'&&method==='GET') {
+    role(u,'supplier','admin','merchant');
+    const supplierId=u.role==='supplier'?u.supplier_id:int(Number(url.searchParams.get('supplier_id')),'المورد',1);
+    const merchantId=u.role==='merchant'?u.id:int(Number(url.searchParams.get('merchant_id')),'المحل',1);
+    return ledgerEngine.getCreditTerms(supplierId,merchantId);
+  }
+  if(p==='/api/ledger/credit-terms'&&method==='POST') {
+    role(u,'supplier','admin');
+    return ledgerEngine.setCreditTerms(u,b);
+  }
+  if(p==='/api/pro/subscription'&&method==='GET') {
+    const type=u.role==='supplier'?'supplier':'merchant';
+    const entityId=u.role==='supplier'?u.supplier_id:u.id;
+    return analyticsEngine.getSubscription(type,entityId);
+  }
+  if(p==='/api/admin/subscriptions'&&method==='POST') {
+    role(u,'admin');
+    if(b.action==='cancel')return analyticsEngine.cancelSubscription(u,b);
+    return analyticsEngine.activateSubscription(u,b);
+  }
+  if(p==='/api/pro/overview'&&method==='GET') {
+    role(u,'supplier','merchant','admin');
+    analyticsEngine.requirePro(u);
+    const days=Number(url.searchParams.get('days')||30);
+    if(u.role==='supplier')return analyticsEngine.getSupplierProOverview(u.supplier_id,{days});
+    if(u.role==='merchant')return analyticsEngine.getMerchantProOverview(u.id,{days});
+    const targetSupplier=url.searchParams.get('supplier_id');
+    if(targetSupplier)return analyticsEngine.getSupplierProOverview(Number(targetSupplier),{days});
+    const targetMerchant=url.searchParams.get('merchant_id');
+    if(targetMerchant)return analyticsEngine.getMerchantProOverview(Number(targetMerchant),{days});
+    return {ok:true,is_admin:true};
+  }
+  if(p==='/api/pro/export'&&method==='GET') {
+    role(u,'supplier','merchant','admin');
+    analyticsEngine.requirePro(u);
+    const type=url.searchParams.get('type')||'top_products';
+    let rows=[];
+    if(u.role==='supplier'){
+      const data=analyticsEngine.getSupplierProOverview(u.supplier_id,{days:30});
+      if(type==='top_products')rows=data.top_products;
+      else if(type==='regions')rows=data.regions;
+      else if(type==='fast_growing')rows=data.fast_growing;
+    }else if(u.role==='merchant'){
+      const data=analyticsEngine.getMerchantProOverview(u.id,{days:30});
+      if(type==='top_purchased')rows=data.top_purchased;
+      else if(type==='wholesale_trends')rows=data.wholesale_market_trends;
+    }
+    const csv=analyticsEngine.exportReportCsv(type,rows);
+    res.setHeader('Content-Type','text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="rafid_${type}.csv"`);
+    res.end(csv);
+    return;
+  }
   fail(404,'المسار غير موجود');
 }
 
-const files={'/offers-ui.js':['offers-ui.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/styles.css':['styles.css','text/css; charset=utf-8'],'/manifest.webmanifest':['manifest.webmanifest','application/manifest+json'],'/icon.svg':['icon.svg','image/svg+xml']};
+const files={'/offers-ui.js':['offers-ui.js','text/javascript; charset=utf-8'],'/ledger-ui.js':['ledger-ui.js','text/javascript; charset=utf-8'],'/pro-ui.js':['pro-ui.js','text/javascript; charset=utf-8'],'/':['index.html','text/html; charset=utf-8'],'/app.js':['app.js','text/javascript; charset=utf-8'],'/styles.css':['styles.css','text/css; charset=utf-8'],'/manifest.webmanifest':['manifest.webmanifest','application/manifest+json'],'/icon.svg':['icon.svg','image/svg+xml']};
 const server=http.createServer(async(req,res)=>{
   res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('Referrer-Policy','same-origin'); res.setHeader('X-Frame-Options','DENY');
   res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
@@ -311,7 +427,7 @@ const server=http.createServer(async(req,res)=>{
       const sessionHash=session?hash(session):'';
       const u=session?one('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.active=1',sessionHash,Date.now()):null;
       if(u) u.sessionHash=sessionHash;
-      const result=await api(req,res,url,u,b); res.end(JSON.stringify(result));
+      const result=await api(req,res,url,u,b); if(!res.writableEnded) res.end(JSON.stringify(result));
     }else {
       need(req.method==='GET','طريقة غير مسموحة',405); const f=files[url.pathname]; need(f,'الصفحة غير موجودة',404); res.setHeader('Content-Type',f[1]); res.setHeader('Cache-Control','no-cache'); res.end(readFileSync(resolve(root,'public',f[0])));
     }
